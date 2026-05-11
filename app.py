@@ -7,7 +7,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 import io
 import os
 from datetime import datetime
-import openai
+from openai import OpenAI
 
 # 페이지 설정
 st.set_page_config(
@@ -58,7 +58,7 @@ with st.sidebar:
     )
     
     if api_key_input:
-        openai.api_key = api_key_input
+        st.session_state["openai_api_key"] = api_key_input
         st.success("✅ API 키 설정됨")
     else:
         st.warning("⚠️ GPT 분석을 위해 API 키가 필요합니다")
@@ -201,15 +201,15 @@ def parse_finance_excel(file):
         st.error(f"재무정보 파싱 오류: {str(e)}")
         return None
 
-def call_gpt_analysis(company_name, project_name, has_api_key):
+def call_gpt_analysis(company_name, project_name, api_key):
     """GPT API 호출 - 시장 분석"""
-    if not has_api_key:
+    if not api_key:
         return {
             'market_size': '[GPT API 키가 필요합니다]',
             'competitors': '[GPT API 키가 필요합니다]',
             'strategy': '[GPT API 키가 필요합니다]'
         }
-    
+
     try:
         prompt = f"""
 다음 기업의 사업화 분석을 해주세요:
@@ -224,8 +224,9 @@ def call_gpt_analysis(company_name, project_name, has_api_key):
 
 각 항목을 300자 이내로 간결하게 작성해주세요.
 """
-        
-        response = openai.ChatCompletion.create(
+
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "당신은 기술 사업화 전문 컨설턴트입니다."},
@@ -234,7 +235,7 @@ def call_gpt_analysis(company_name, project_name, has_api_key):
             temperature=0.7,
             max_tokens=2000
         )
-        
+
         result = response.choices[0].message.content
         
         # 간단한 파싱
@@ -253,7 +254,7 @@ def call_gpt_analysis(company_name, project_name, has_api_key):
             'strategy': '오류 발생'
         }
 
-def generate_report(pdf_text, project_data, finance_data, use_gpt=False, has_api_key=False):
+def generate_report(pdf_text, project_data, finance_data, use_gpt=False, api_key=""):
     """사업화분석 보고서 생성 - GPT 연동 버전"""
     doc = Document()
     
@@ -320,9 +321,9 @@ def generate_report(pdf_text, project_data, finance_data, use_gpt=False, has_api
     
     # GPT 분석 (선택적)
     gpt_analysis = None
-    if use_gpt and has_api_key:
+    if use_gpt and api_key:
         with st.spinner("🤖 GPT 분석 중..."):
-            gpt_analysis = call_gpt_analysis(company, project_name, has_api_key)
+            gpt_analysis = call_gpt_analysis(company, project_name, api_key)
     
     # 2. 기업 정보
     doc.add_heading('2. 기업 정보', 1)
@@ -434,18 +435,18 @@ if st.button("🚀 보고서 생성", type="primary", use_container_width=True):
                 finance_data = parse_finance_excel(finance_file) if finance_file else None
                 
                 # API 키 확인
-                has_api_key = bool(api_key_input)
-                
-                if use_gpt and not has_api_key:
+                api_key = api_key_input or ""
+
+                if use_gpt and not api_key:
                     st.warning("⚠️ GPT 분석을 사용하려면 API 키를 입력해주세요. 기본 템플릿으로 생성합니다.")
-                
+
                 # 보고서 생성
                 report_buffer = generate_report(
-                    pdf_text, 
-                    project_data, 
-                    finance_data, 
+                    pdf_text,
+                    project_data,
+                    finance_data,
                     use_gpt=use_gpt,
-                    has_api_key=has_api_key
+                    api_key=api_key
                 )
                 
                 # 성공 메시지
@@ -469,7 +470,7 @@ if st.button("🚀 보고서 생성", type="primary", use_container_width=True):
                 - 기업명: {project_data[0].get('기업명', '-')}
                 - 과제명: {project_data[0].get('과제명', '-')}
                 - 재무 데이터: {len(finance_data) if finance_data else 0}개 연도
-                - GPT 분석: {'사용' if (use_gpt and has_api_key) else '미사용'}
+                - GPT 분석: {'사용' if (use_gpt and api_key) else '미사용'}
                 - 생성 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 """)
                 
