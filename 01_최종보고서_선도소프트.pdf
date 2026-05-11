@@ -1,0 +1,473 @@
+// src/pages/analysis/CompanyNewsAnalysis.jsx
+// ANL002 기업상세분석 내 "언론분석" 탭 컴포넌트
+// 사용법: <CompanyNewsAnalysis companyName="넥스트바이오" />
+
+import { useState, useCallback } from 'react';
+import {
+  Card, Table, Tag, Button, Spin, Alert, Tabs, Descriptions,
+  Space, Typography, Progress, Tooltip, Divider, Empty, Badge
+} from 'antd';
+import {
+  SearchOutlined, ReloadOutlined, FileTextOutlined,
+  RiseOutlined, FallOutlined, InfoCircleOutlined
+} from '@ant-design/icons';
+
+const { Text, Title, Paragraph } = Typography;
+const { TabPane } = Tabs;
+
+// ==================== 설정 ====================
+const CONFIG = {
+  // rss2json.com 무료 API (CORS 우회용, 일 10,000건)
+  // 프로덕션에서는 백엔드 프록시로 전환 권장
+  rss2jsonBase: 'https://api.rss2json.com/v1/api.json',
+  maxArticles: 20,
+  rssDays: 90,
+  openaiModel: 'gpt-4o-mini',
+  openaiMaxTokens: 1500,
+};
+
+// 시기 기준 (일)
+const PERIOD = { recent: 30, mid: 90 };
+
+// 긍/부정 키워드
+const POS_KW = [
+  '수주','계약','공급','납품','선정','수상','인증','특허','출시','론칭','런칭',
+  '투자','투자유치','시리즈','MOU','협약','파트너십','조달','우선구매','실증','상용화',
+  '흑자','성장','매출','수출','협력','개발','양산','체결'
+];
+const NEG_KW = [
+  '소송','피소','고소','고발','회생','파산','부도','폐업','영업정지','리콜','해킹','유출','사고',
+  '과징금','제재','압수수색','횡령','배임','상장폐지','감사거절','적자','감원','구조조정','철수'
+];
+
+// ==================== 유틸 ====================
+
+const normalizeName = (name) => {
+  if (!name) return '';
+  return name.trim()
+    .replace(/\(주\)|㈜|\(유\)|유한회사|주식회사/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+};
+
+const classifyPeriod = (dateStr) => {
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return '날짜불명';
+  const diff = (Date.now() - d.getTime()) / (1000 * 60 * 60 * 24);
+  if (diff <= PERIOD.recent) return '최근30일';
+  if (diff <= PERIOD.mid) return '30~90일';
+  return '90일이전';
+};
+
+const hasKeyword = (text, kwList) =>
+  kwList.some(k => (text || '').includes(k));
+
+const periodColor = { '최근30일': 'green', '30~90일': 'gold', '90일이전': 'default', '날짜불명': 'default' };
+const tagConfig = {
+  '성과정황':   { color: 'success' },
+  '리스크감지': { color: 'error' },
+  '보도활발':   { color: 'warning' },
+  '보도미미':   { color: 'default' },
+  '정보부족':   { color: 'default' },
+};
+const likelihoodColor = { '높음': 'green', '중간': 'gold', '낮음': 'red', '판단불가': 'default' };
+
+// ==================== API 호출 ====================
+
+// Google News RSS → rss2json (CORS 우회)
+const fetchNews = async (company) => {
+  const normalized = normalizeName(company);
+  if (!normalized) return [];
+
+  const rssUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(
+    `"${normalized}" when:${CONFIG.rssDays}d`
+  )}&hl=ko&gl=KR&ceid=KR:ko`;
+
+  const apiUrl = `${CONFIG.rss2jsonBase}?rss_url=${encodeURIComponent(rssUrl)}`;
+
+  try {
+    const res = await fetch(apiUrl);
+    const data = await res.json();
+    if (data.status !== 'ok') return [];
+
+    return (data.items || []).slice(0, CONFIG.maxArticles).map((item) => {
+      const period = classifyPeriod(item.pubDate);
+      return {
+        key: item.link,
+        title: item.title || '',
+        link: item.link || '',
+        pubDate: item.pubDate || '',
+        period,
+        isPositive: hasKeyword(item.title, POS_KW),
+        isNegative: hasKeyword(item.title, NEG_KW),
+      };
+    });
+  } catch (e) {
+    console.error('RSS fetch error:', e);
+    return [];
+  }
+};
+
+// GPT 분석
+const analyzeWithGpt = async (company, articles, apiKey) => {
+  if (!articles.length) {
+    return {
+      company_profile: '정보 부족',
+      news_summary: `${company} 관련 최근 ${CONFIG.rssDays}일간 보도가 확인되지 않음.`,
+      achievement_likelihood: '판단불가',
+      achievement_reason: '보도 자체가 없어 판단 불가.',
+      risk_detected: false,
+      risk_detail: '',
+      overall_tag: '정보부족',
+    };
+  }
+
+  // 시기별 그룹핑
+  const grouped = {};
+  articles.forEach((a) => {
+    if (!grouped[a.period]) grouped[a.period] = [];
+    grouped[a.period].push(a.title);
+  });
+
+  const articleSection = Object.entries(grouped)
+    .map(([period, titles]) =>
+      `[${period}]\n${titles.map((t, i) => `${i + 1}. ${t}`).join('\n')}`
+    )
+    .join('\n\n');
+
+  const prompt = `당신은 기술이전·사업화 분야 10년차 전문 애널리스트입니다.
+
+[1단계 - 기업 프로파일링]
+기업명: ${company}
+이 기업에 대해 알고 있는 정보(업종, 주요 기술/제품, 규모, 시장 포지션)를 2문장 이내로 정리하세요.
+모르면 "정보 부족. 기사 내용 기반으로 추정:" 으로 시작하여 기사에서 유추 가능한 내용을 적으세요.
+
+[2단계 - 뉴스 기반 정밀 분석]
+아래는 이 기업의 최근 뉴스 제목을 시기별로 분류한 목록입니다:
+
+${articleSection}
+
+위 기업 프로필과 뉴스 제목을 종합 분석하여, 반드시 아래 JSON 형식으로만 응답하세요.
+다른 텍스트 없이 JSON만 출력하세요.
+
+{
+  "company_profile": "업종/기술/규모 2문장 이내",
+  "news_summary": "핵심 동향 2~3문장. 시기별 흐름 변화를 반영할 것",
+  "achievement_likelihood": "높음/중간/낮음/판단불가",
+  "achievement_reason": "성과 발생 가능성의 근거 1~2문장. 구체적 기사 내용을 인용할 것",
+  "risk_detected": true 또는 false,
+  "risk_detail": "리스크 내용 (없으면 빈 문자열)",
+  "overall_tag": "성과정황/리스크감지/보도활발/보도미미/정보부족"
+}
+
+[판단 기준]
+- 성과정황: 수주/계약/투자/인증/특허/MOU 등 실질적 성과 정황이 2건 이상
+- 리스크감지: 소송/압수수색/파산/횡령 등 부정적 이슈가 1건 이상
+- 보도활발: 기사 5건 이상이나 뚜렷한 성과/리스크 없음
+- 보도미미: 기사 2건 이하
+- 정보부족: 기사 0건
+- 긍정과 부정이 혼재시, 최근30일 기사의 톤을 우선 반영할 것`;
+
+  try {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: CONFIG.openaiModel,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: CONFIG.openaiMaxTokens,
+        temperature: 0.3,
+      }),
+    });
+
+    const body = await res.json();
+    if (body.error) throw new Error(body.error.message);
+
+    const raw = body.choices[0].message.content.trim();
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('JSON 파싱 실패');
+
+    return JSON.parse(jsonMatch[0]);
+  } catch (e) {
+    console.error('GPT error:', e);
+    return {
+      company_profile: 'GPT 호출 실패',
+      news_summary: `오류: ${e.message}`,
+      achievement_likelihood: '판단불가',
+      achievement_reason: '',
+      risk_detected: false,
+      risk_detail: '',
+      overall_tag: '정보부족',
+    };
+  }
+};
+
+// ==================== 메인 컴포넌트 ====================
+
+export default function CompanyNewsAnalysis({ companyName }) {
+  const [loading, setLoading] = useState(false);
+  const [articles, setArticles] = useState([]);
+  const [gptResult, setGptResult] = useState(null);
+  const [error, setError] = useState(null);
+
+  // TODO: 프로덕션에서는 환경변수 또는 백엔드에서 관리
+  // .env 파일에 REACT_APP_OPENAI_API_KEY 로 저장 권장
+  const openaiKey = process.env.REACT_APP_OPENAI_API_KEY || '';
+
+  const runAnalysis = useCallback(async () => {
+    if (!companyName) return;
+    setLoading(true);
+    setError(null);
+
+    try {
+      // 1단계: RSS 기사 수집
+      const items = await fetchNews(companyName);
+      setArticles(items);
+
+      // 2단계: GPT 분석
+      if (!openaiKey) {
+        setError('OpenAI API 키가 설정되지 않았습니다. .env 파일에 REACT_APP_OPENAI_API_KEY를 추가하세요.');
+        setLoading(false);
+        return;
+      }
+      const result = await analyzeWithGpt(normalizeName(companyName), items, openaiKey);
+      setGptResult(result);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [companyName, openaiKey]);
+
+  // 통계 계산
+  const stats = {
+    total: articles.length,
+    recent: articles.filter(a => a.period === '최근30일').length,
+    mid: articles.filter(a => a.period === '30~90일').length,
+    old: articles.filter(a => a.period === '90일이전').length,
+    pos: articles.filter(a => a.isPositive).length,
+    neg: articles.filter(a => a.isNegative).length,
+  };
+
+  // 테이블 컬럼
+  const columns = [
+    {
+      title: '기사 제목',
+      dataIndex: 'title',
+      key: 'title',
+      render: (text, record) => (
+        <a href={record.link} target="_blank" rel="noopener noreferrer">
+          {text}
+        </a>
+      ),
+      width: '50%',
+    },
+    {
+      title: '게시일',
+      dataIndex: 'pubDate',
+      key: 'pubDate',
+      width: 120,
+      render: (text) => {
+        const d = new Date(text);
+        return isNaN(d.getTime()) ? text : d.toLocaleDateString('ko-KR');
+      },
+    },
+    {
+      title: '시기구분',
+      dataIndex: 'period',
+      key: 'period',
+      width: 100,
+      filters: [
+        { text: '최근30일', value: '최근30일' },
+        { text: '30~90일', value: '30~90일' },
+        { text: '90일이전', value: '90일이전' },
+      ],
+      onFilter: (value, record) => record.period === value,
+      render: (text) => <Tag color={periodColor[text]}>{text}</Tag>,
+    },
+    {
+      title: '긍정',
+      dataIndex: 'isPositive',
+      key: 'isPositive',
+      width: 60,
+      align: 'center',
+      render: (v) => v ? <RiseOutlined style={{ color: '#52c41a', fontSize: 16 }} /> : '-',
+    },
+    {
+      title: '부정',
+      dataIndex: 'isNegative',
+      key: 'isNegative',
+      width: 60,
+      align: 'center',
+      render: (v) => v ? <FallOutlined style={{ color: '#ff4d4f', fontSize: 16 }} /> : '-',
+    },
+  ];
+
+  return (
+    <div style={{ padding: '0' }}>
+      {/* 분석 실행 버튼 */}
+      <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <Space>
+          <Title level={5} style={{ margin: 0 }}>
+            <FileTextOutlined /> 언론 동향 분석
+          </Title>
+          <Text type="secondary">Google News RSS + GPT 분석</Text>
+        </Space>
+        <Button
+          type="primary"
+          icon={articles.length ? <ReloadOutlined /> : <SearchOutlined />}
+          loading={loading}
+          onClick={runAnalysis}
+        >
+          {articles.length ? '재분석' : '분석 시작'}
+        </Button>
+      </div>
+
+      {error && (
+        <Alert
+          message="오류 발생"
+          description={error}
+          type="error"
+          showIcon
+          closable
+          style={{ marginBottom: 16 }}
+        />
+      )}
+
+      {loading && (
+        <div style={{ textAlign: 'center', padding: 60 }}>
+          <Spin size="large" />
+          <div style={{ marginTop: 16 }}>
+            <Text type="secondary">기사 수집 및 GPT 분석 중...</Text>
+          </div>
+        </div>
+      )}
+
+      {!loading && !articles.length && !error && (
+        <Empty description="분석 시작 버튼을 눌러주세요" />
+      )}
+
+      {!loading && articles.length > 0 && (
+        <Tabs defaultActiveKey="summary">
+          {/* ===== 요약 탭 ===== */}
+          <TabPane tab="GPT 분석 요약" key="summary">
+            {gptResult && (
+              <div>
+                {/* 통계 카드 */}
+                <div style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+                  gap: 12,
+                  marginBottom: 20,
+                }}>
+                  <StatCard label="전체 기사" value={stats.total} color="#1890ff" />
+                  <StatCard label="최근 30일" value={stats.recent} color="#52c41a" />
+                  <StatCard label="30~90일" value={stats.mid} color="#faad14" />
+                  <StatCard label="90일 이전" value={stats.old} color="#bfbfbf" />
+                  <StatCard label="긍정 신호" value={stats.pos} color="#52c41a" />
+                  <StatCard label="부정 신호" value={stats.neg} color="#ff4d4f" />
+                </div>
+
+                {/* 종합 태그 + 성과 가능성 */}
+                <Card size="small" style={{ marginBottom: 16 }}>
+                  <Space size="large">
+                    <div>
+                      <Text type="secondary">종합 판단: </Text>
+                      <Tag
+                        color={tagConfig[gptResult.overall_tag]?.color || 'default'}
+                        style={{ fontSize: 14, padding: '2px 12px' }}
+                      >
+                        {gptResult.overall_tag}
+                      </Tag>
+                    </div>
+                    <div>
+                      <Text type="secondary">성과 가능성: </Text>
+                      <Tag
+                        color={likelihoodColor[gptResult.achievement_likelihood] || 'default'}
+                        style={{ fontSize: 14, padding: '2px 12px' }}
+                      >
+                        {gptResult.achievement_likelihood}
+                      </Tag>
+                    </div>
+                    {gptResult.risk_detected && (
+                      <div>
+                        <Badge status="error" text={<Text type="danger">리스크 감지</Text>} />
+                      </div>
+                    )}
+                  </Space>
+                </Card>
+
+                {/* 상세 분석 */}
+                <Descriptions
+                  bordered
+                  column={1}
+                  size="small"
+                  labelStyle={{ width: 140, fontWeight: 600, backgroundColor: '#fafafa' }}
+                >
+                  <Descriptions.Item label="기업 프로필">
+                    {gptResult.company_profile}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="핵심 요약">
+                    <Paragraph style={{ margin: 0, whiteSpace: 'pre-wrap' }}>
+                      {gptResult.news_summary}
+                    </Paragraph>
+                  </Descriptions.Item>
+                  <Descriptions.Item label="성과 근거">
+                    {gptResult.achievement_reason || '-'}
+                  </Descriptions.Item>
+                  {gptResult.risk_detail && (
+                    <Descriptions.Item label="리스크 상세">
+                      <Text type="danger">{gptResult.risk_detail}</Text>
+                    </Descriptions.Item>
+                  )}
+                </Descriptions>
+              </div>
+            )}
+          </TabPane>
+
+          {/* ===== 기사 목록 탭 ===== */}
+          <TabPane tab={`기사 목록 (${articles.length}건)`} key="articles">
+            <Table
+              columns={columns}
+              dataSource={articles}
+              size="small"
+              pagination={{ pageSize: 10, showSizeChanger: true }}
+              rowClassName={(record) =>
+                record.isNegative ? 'row-negative' : record.isPositive ? 'row-positive' : ''
+              }
+            />
+          </TabPane>
+        </Tabs>
+      )}
+
+      {/* 행 색상 스타일 */}
+      <style>{`
+        .row-positive { background-color: #f6ffed; }
+        .row-negative { background-color: #fff2f0; }
+        .row-positive:hover td, .row-negative:hover td {
+          background-color: inherit !important;
+        }
+      `}</style>
+    </div>
+  );
+}
+
+// 통계 카드 서브 컴포넌트
+function StatCard({ label, value, color }) {
+  return (
+    <Card
+      size="small"
+      style={{
+        textAlign: 'center',
+        borderTop: `3px solid ${color}`,
+      }}
+      bodyStyle={{ padding: '12px 8px' }}
+    >
+      <div style={{ fontSize: 24, fontWeight: 700, color }}>{value}</div>
+      <Text type="secondary" style={{ fontSize: 12 }}>{label}</Text>
+    </Card>
+  );
+}
