@@ -111,15 +111,46 @@ st.markdown("---")
 
 # 파일 파싱 함수
 def parse_pdf(pdf_file):
-    """PDF에서 텍스트 추출"""
+    """PDF에서 텍스트 추출 (페이지 구분 보존)"""
     try:
         with pdfplumber.open(pdf_file) as pdf:
-            text = ""
+            pages = []
             for page in pdf.pages:
-                text += page.extract_text() or ""
-        return text
+                # 한국어 세로조판/사이드바를 어느 정도 완화하기 위해 tolerance 조정
+                t = page.extract_text(x_tolerance=2, y_tolerance=3) or ""
+                if t.strip():
+                    pages.append(t)
+        return "\n\n".join(pages)
     except Exception as e:
         return f"PDF 파싱 실패: {str(e)}"
+
+
+def _clean_pdf_text(text: str) -> str:
+    """추출된 PDF 텍스트의 흔한 잡음 정리.
+
+    - 한 줄에 한 글자만 있는 라인(세로 사이드바)을 합침
+    - 과도한 공백/줄바꿈 압축
+    """
+    import re
+    lines = text.split('\n')
+    cleaned = []
+    buf_single = []
+    for line in lines:
+        stripped = line.strip()
+        if len(stripped) <= 1:
+            if stripped:
+                buf_single.append(stripped)
+            continue
+        if buf_single:
+            cleaned.append(''.join(buf_single))
+            buf_single = []
+        cleaned.append(stripped)
+    if buf_single:
+        cleaned.append(''.join(buf_single))
+    out = '\n'.join(cleaned)
+    out = re.sub(r'\n{3,}', '\n\n', out)
+    out = re.sub(r'[ \t]{2,}', ' ', out)
+    return out.strip()
 
 def parse_project_excel(file):
     """과제정보 엑셀 파싱 - 유연한 버전"""
@@ -337,7 +368,11 @@ def generate_report(pdf_text, project_data, finance_data, use_gpt=False, api_key
     # 3. 기술 성과
     doc.add_heading('3. 기술 성과', 1)
     if pdf_text and len(pdf_text) > 100:
-        doc.add_paragraph(pdf_text[:1000] + "...")
+        cleaned = _clean_pdf_text(pdf_text)
+        for para in cleaned.split('\n\n'):
+            para = para.strip()
+            if para:
+                doc.add_paragraph(para)
     else:
         doc.add_paragraph("[PDF 파일을 업로드하면 자동으로 추출됩니다]")
     
@@ -369,7 +404,12 @@ def generate_report(pdf_text, project_data, finance_data, use_gpt=False, api_key
             row = table.add_row()
             for i, col in enumerate(display_cols):
                 value = f.get(col, '')
-                if isinstance(value, (int, float)) and value != '':
+                if col == '연도':
+                    if isinstance(value, (int, float)) and value != '':
+                        row.cells[i].text = f"{int(value)}"
+                    else:
+                        row.cells[i].text = str(value) if value else '-'
+                elif isinstance(value, (int, float)) and value != '':
                     row.cells[i].text = f"{value:,.0f}"
                 else:
                     row.cells[i].text = str(value) if value else '-'
