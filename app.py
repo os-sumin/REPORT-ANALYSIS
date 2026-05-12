@@ -58,8 +58,22 @@ with st.sidebar:
     )
     
     if api_key_input:
-        st.session_state["openai_api_key"] = api_key_input
-        st.success("✅ API 키 설정됨")
+        _trimmed = api_key_input.strip()
+        try:
+            _trimmed.encode('ascii')
+            _is_ascii = True
+        except UnicodeEncodeError:
+            _is_ascii = False
+        if not _is_ascii:
+            st.error(
+                "❌ API 키에 한글/특수문자가 섞여있습니다. "
+                "한글 입력기를 끄고 영문/숫자만 붙여넣어 주세요."
+            )
+        elif not _trimmed.startswith('sk-'):
+            st.warning("⚠️ API 키는 'sk-' 로 시작해야 합니다. 형식을 확인해주세요.")
+        else:
+            st.session_state["openai_api_key"] = _trimmed
+            st.success(f"✅ API 키 설정됨 (길이 {len(_trimmed)})")
     else:
         st.warning("⚠️ GPT 분석을 위해 API 키가 필요합니다")
     
@@ -241,6 +255,29 @@ def call_gpt_analysis(company_name, project_name, api_key):
             'strategy': '[GPT API 키가 필요합니다]'
         }
 
+    # API 키 정리: 양끝 공백/줄바꿈 제거, 비-ASCII 검사
+    cleaned_key = api_key.strip()
+    try:
+        cleaned_key.encode('ascii')
+    except UnicodeEncodeError:
+        msg = (
+            "OpenAI API 키에 한글 또는 보이지 않는 특수문자가 섞여 있습니다. "
+            "키를 복사할 때 한글 입력기가 켜져 있거나 메신저를 통해 받을 때 "
+            "보이지 않는 문자가 섞이는 경우가 흔합니다. "
+            "https://platform.openai.com/api-keys 에서 새로 발급받아 영문/숫자만 붙여넣어 주세요."
+        )
+        return {
+            'market_size': f'GPT 분석 오류: {msg}',
+            'competitors': '오류 발생',
+            'strategy': '오류 발생'
+        }
+    if not cleaned_key.startswith('sk-'):
+        return {
+            'market_size': 'GPT 분석 오류: API 키는 "sk-" 로 시작해야 합니다. 키 형식을 확인해주세요.',
+            'competitors': '오류 발생',
+            'strategy': '오류 발생'
+        }
+
     try:
         prompt = f"""
 다음 기업의 사업화 분석을 해주세요:
@@ -256,7 +293,7 @@ def call_gpt_analysis(company_name, project_name, api_key):
 각 항목을 300자 이내로 간결하게 작성해주세요.
 """
 
-        client = OpenAI(api_key=api_key)
+        client = OpenAI(api_key=cleaned_key)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
